@@ -1,107 +1,177 @@
-# This is a demo of a safe key exchange between two users
-# The server does not know what the keys are
-# This code is just a demo and will be reworked
-
 import os
+import json
 import base64
-from dataclasses import dataclass
-from cryptography.hazmat.primitives import hashes, serialization
+import asyncio
+import websockets
+
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes, serialization
 
 
-def b64(b):
-    return base64.b64encode(b).decode("ascii")
+def b64e(x: bytes) -> str:
+    return base64.b64encode(x).decode("ascii")
 
 
-def hkdf_32(shared_secret, salt, info):
+def b64d(x: str) -> bytes:
+    return base64.b64decode(x.encode("ascii"))
+
+
+def hkdf(x: bytes) -> bytes:
     return HKDF(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=salt,
-        info=info,
-    ).derive(shared_secret)
+        salt=None,
+        info=b"chat",
+    ).derive(x)
 
 
-def aead_encrypt(key, pt, aad=b""):
+def encrypt(key: bytes, data: bytes) -> bytes:
     nonce = os.urandom(12)
-    return nonce + ChaCha20Poly1305(key).encrypt(nonce, pt, aad)
+    ct = ChaCha20Poly1305(key).encrypt(nonce, data, None)
+    return nonce + ct
 
 
-def aead_decrypt(key, blob, aad=b""):
-    return ChaCha20Poly1305(key).decrypt(blob[:12], blob[12:], aad)
+def decrypt(key: bytes, blob: bytes) -> bytes:
+    nonce = blob[:12]
+    ct = blob[12:]
+    return ChaCha20Poly1305(key).decrypt(nonce, ct, None)
 
 
-def x25519_pub_bytes(pub):
-    return pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+def pub_bytes(pub: x25519.X25519PublicKey) -> bytes:
+    return pub.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
 
 
-def x25519_pub_from_bytes(b):
-    return x25519.X25519PublicKey.from_public_bytes(b)
+class Client:
+    def __init__(self, name: str, peer: str):
+        self.name = name
+        self.peer = peer
 
+        self.init_priv = x25519.X25519PrivateKey.generate()
+        self.init_pub = self.init_priv.public_key()
 
-@dataclass
-class User:
-    init_priv: x25519.X25519PrivateKey
-    init_pub: x25519.X25519PublicKey
-    k1: bytes = None
-    k1_salt: bytes = None
-    chat_priv: x25519.X25519PrivateKey = None
-    chat_pub: x25519.X25519PublicKey = None
-    k2: bytes = None
-
-    @classmethod
-    def create(cls):
-        priv = x25519.X25519PrivateKey.generate()
-        return cls(priv, priv.public_key())
-
-    def derive_k1(self, other_pub, salt):
-        self.k1_salt = salt
-        self.k1 = hkdf_32(self.init_priv.exchange(other_pub), salt, b"messenger:k1")
-
-    def gen_chat_keys(self):
         self.chat_priv = x25519.X25519PrivateKey.generate()
         self.chat_pub = self.chat_priv.public_key()
 
-    def enc_chat_pub(self):
-        if self.k1 is None:
+        self.k1 = None
+        self.session_key = None
+        self.sent_chatkey = False
+
+    async def run(self):
+        uri = f"ws://127.0.0.1:9000/ws/{self.name}"
+
+        async with websockets.connect(uri) as ws:
+            self.ws = ws
+
+            await self.ws.send(json.dumps({
+                "type": "init",
+                "pubkey": b64e(pub_bytes(self.init_pub)),
+            }))
+
+            print("connected")
+            print("commands: /handshake, /quit")
+
+            listener = asyncio.create_task(self.listen())
+
+            while True:
+                text = await asyncio.to_thread(input, "> ")
+                text = text.strip()
+
+                if text == "/quit":
+                    listener.cancel()
+                    break
+
+                if text == "/handshake":
+                    await self.ws.send(json.dumps({
+                        "type": "get_peer_key",
+                        "peer": self.peer,
+                    }))
+                    continue
+
+                if not self.session_key:
+                    print("no secure session")
+                    continue
+
+                blob = encrypt(self.session_key, text.encode("utf-8"))
+
+                await self.ws.send(json.dumps({
+                    "type": "msg",
+                    "peer": self.peer,
+                    "blob": b64e(blob),
+                }))
+
+    async def send_chatkey(self):
+        if self.sent_chatkey:
             return
-        return aead_encrypt(self.k1, x25519_pub_bytes(self.chat_pub), b"chat-pub2")
 
-    def dec_chat_pub(self, blob):
-        return x25519_pub_from_bytes(aead_decrypt(self.k1, blob, b"chat-pub2"))
+        inner = pub_bytes(self.chat_pub)
 
-    def derive_k2(self, other_chat_pub):
-        if not self.chat_priv:
-            return
-        salt = self.k1_salt or b"\x00" * 16
-        self.k2 = hkdf_32(self.chat_priv.exchange(other_chat_pub), salt, b"messenger:k2")
+        blob = encrypt(self.k1, inner)
+
+        await self.ws.send(json.dumps({
+            "type": "chatkey",
+            "peer": self.peer,
+            "blob": b64e(blob),
+        }))
+
+        self.sent_chatkey = True
+        print("chatkey sent")
+
+    async def listen(self):
+        async for raw in self.ws:
+            data = json.loads(raw)
+            msg_type = data["type"]
+
+            if msg_type == "peer_key":
+                peer_init_pub = x25519.X25519PublicKey.from_public_bytes(
+                    b64d(data["pubkey"])
+                )
+                self.k1 = hkdf(self.init_priv.exchange(peer_init_pub))
+                await self.send_chatkey()
+
+            elif msg_type == "chatkey":
+                sender_init_pub = x25519.X25519PublicKey.from_public_bytes(
+                    b64d(data["sender_init_pub"])
+                )
+
+                self.k1 = hkdf(self.init_priv.exchange(sender_init_pub))
+
+                peer_chat_pub = x25519.X25519PublicKey.from_public_bytes(
+                    decrypt(self.k1, b64d(data["blob"]))
+                )
+
+                if not self.sent_chatkey:
+                    blob = encrypt(self.k1, pub_bytes(self.chat_pub))
+                    await self.ws.send(json.dumps({
+                        "type": "chatkey",
+                        "peer": data["sender"],
+                        "blob": b64e(blob),
+                    }))
+                    self.sent_chatkey = True
+                    print("chatkey replied")
+
+                self.session_key = hkdf(self.chat_priv.exchange(peer_chat_pub))
+                print("secure session ready")
+
+            elif msg_type == "msg":
+                if not self.session_key:
+                    continue
+
+                text = decrypt(self.session_key, b64d(data["blob"])).decode("utf-8")
+                print(f"\n[{data['sender']}] {text}")
 
 
-def main():
-    u1, u2 = User.create(), User.create()
-    salt = os.urandom(16)
+async def main():
+    name = input("username: ").strip()
+    peer = input("peer: ").strip()
 
-    u1.derive_k1(x25519_pub_from_bytes(x25519_pub_bytes(u2.init_pub)), salt)
-    u2.derive_k1(x25519_pub_from_bytes(x25519_pub_bytes(u1.init_pub)), salt)
-
-    assert u1.k1 == u2.k1
-
-    u1.gen_chat_keys()
-    u2.gen_chat_keys()
-
-    u1.derive_k2(u1.dec_chat_pub(u2.enc_chat_pub()))
-    u2.derive_k2(u2.dec_chat_pub(u1.enc_chat_pub()))
-
-    assert u1.k2 == u2.k2
-
-    msg = b"This is a test message"
-    ct = aead_encrypt(u1.k2, msg, b"msg")
-    pt = aead_decrypt(u2.k2, ct, b"msg")
-
-    print(pt.decode("utf-8"))
+    client = Client(name, peer)
+    await client.run()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
